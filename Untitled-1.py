@@ -645,8 +645,25 @@ def _telemetry_background_worker(state):
     hist_q = state['hist_queue']
     csv_q = state['csv_queue']
     lock = state['lock']
+    last_debug_time = time.time()
 
     while True:
+        # Periodic Non-blocking 30-second Console Debug Log
+        now_sec = time.time()
+        if now_sec - last_debug_time >= 30.0:
+            last_debug_time = now_sec
+            with lock:
+                v_c = state['voltage_count']
+                i_c = state['current_count']
+                p_c = state['power_count']
+                t_c = state['temperature_count']
+                lux_c = state['lux_count']
+                w_c = state['watts_count']
+                com_c = state['committed_cycle_count']
+                disc_c = state['discarded_cycle_count']
+                hist_c = state['history_count']
+            print(f"LIVE DEBUG: V={v_c} | I={i_c} | P={p_c} | T={t_c} | Lux={lux_c} | WATTS={w_c} | COMMITTED={com_c} | DISCARDED={disc_c} | HISTORY={hist_c}", flush=True)
+
         # 1. Process offline History packets
         try:
             hist_item = hist_q.get(timeout=0.1)
@@ -759,7 +776,6 @@ def get_sensor_data():
 
     initial_seen_ts = {str(r.get('timestamp')) for r in initial_records if r.get('timestamp')}
 
-    # Persistent singleton lock and queues inside cached resource
     persistent_lock = threading.RLock()
     hist_queue = queue.Queue(maxsize=3000)
     csv_queue = queue.Queue(maxsize=3000)
@@ -786,10 +802,19 @@ def get_sensor_data():
         'events': [],
         'log_records': initial_records,
         'seen_timestamps': initial_seen_ts,
-        'current_cycle': None
+        'current_cycle': None,
+        # Instrumentation Debug Counters
+        'voltage_count': 0,
+        'current_count': 0,
+        'power_count': 0,
+        'temperature_count': 0,
+        'lux_count': 0,
+        'watts_count': 0,
+        'history_count': 0,
+        'committed_cycle_count': 0,
+        'discarded_cycle_count': 0
     }
 
-    # Start single persistent worker thread
     worker_thread = threading.Thread(target=_telemetry_background_worker, args=(store,), daemon=True)
     worker_thread.start()
 
@@ -845,6 +870,16 @@ with st.sidebar:
             solar_data['seen_timestamps'].clear()
             solar_data['current_cycle'] = None
             solar_data['msg_count'] = 0
+            # Reset Debug Counters
+            solar_data['voltage_count'] = 0
+            solar_data['current_count'] = 0
+            solar_data['power_count'] = 0
+            solar_data['temperature_count'] = 0
+            solar_data['lux_count'] = 0
+            solar_data['watts_count'] = 0
+            solar_data['history_count'] = 0
+            solar_data['committed_cycle_count'] = 0
+            solar_data['discarded_cycle_count'] = 0
         add_event("info", "Telemetry session reset by operator.")
 
 # =========================================================================================
@@ -879,13 +914,14 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
             now_display = now_dt.strftime("%H:%M:%S")
 
             # =========================================================================
-            # 1. OFFLINE STORE-AND-FORWARD INGESTION (Non-blocking queue enqueue)
+            # 1. OFFLINE STORE-AND-FORWARD INGESTION
             # =========================================================================
             is_history_topic = topic_str.endswith('/history')
             has_data_envelope = payload_str.startswith('{"data":') or '"data"' in payload_str
 
             if is_history_topic or has_data_envelope:
-                # Non-blocking put to ensure MQTT loop thread is never stalled
+                with data_lock:
+                    solar_data['history_count'] += 1
                 try:
                     solar_data['hist_queue'].put_nowait((payload_str, now_iso))
                 except queue.Full:
@@ -893,18 +929,18 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                 return
 
             # =========================================================================
-            # 2. LIVE TELEMETRY PARSING (Strict packet isolation without cross-cycle mixing)
+            # 2. LIVE TELEMETRY PARSING
             # =========================================================================
             is_packet_complete = False
             completed_cycle = None
 
             with data_lock:
                 if topic_str.endswith('/voltage'):
-                    # If previous cycle remained in flight without /watts, discard it deterministically
+                    solar_data['voltage_count'] += 1
                     if solar_data['current_cycle'] is not None:
+                        solar_data['discarded_cycle_count'] += 1
                         add_event("warning", "Incomplete telemetry cycle discarded (missing /watts)")
 
-                    # Fresh isolated cycle container
                     solar_data['current_cycle'] = {
                         'start_dt': now_dt,
                         'start_iso': now_iso,
@@ -921,12 +957,14 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                     return
 
                 elif topic_str.endswith('/current'):
+                    solar_data['current_count'] += 1
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['current'] = float(payload_str)
                     solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/power_mw'):
+                    solar_data['power_count'] += 1
                     raw_p = float(payload_str)
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['power_mw'] = raw_p
@@ -935,6 +973,7 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                     return
 
                 elif topic_str.endswith('/power_w'):
+                    solar_data['power_count'] += 1
                     raw_p = float(payload_str)
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['power_w'] = raw_p
@@ -943,6 +982,7 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                     return
 
                 elif topic_str.endswith('/power'):
+                    solar_data['power_count'] += 1
                     raw_p = float(payload_str)
                     if solar_data['current_cycle'] is not None:
                         if incoming_power_unit == "Watts (W)":
@@ -955,20 +995,22 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                     return
 
                 elif topic_str.endswith('/temperature'):
+                    solar_data['temperature_count'] += 1
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['temp'] = float(payload_str)
                     solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/lux'):
+                    solar_data['lux_count'] += 1
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['lux'] = float(payload_str)
                     solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/watts'):
+                    solar_data['watts_count'] += 1
                     solar_data['msg_count'] += 1
-                    # Trigger packet completion only if active cycle exists within valid window (10s)
                     if solar_data['current_cycle'] is not None:
                         elapsed_sec = (now_dt - solar_data['current_cycle']['start_dt']).total_seconds()
                         if 0 <= elapsed_sec <= 10.0:
@@ -978,15 +1020,16 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                             is_packet_complete = True
                         else:
                             solar_data['current_cycle'] = None
+                            solar_data['discarded_cycle_count'] += 1
                             add_event("warning", "Telemetry cycle expired and discarded (timeout)")
                             return
                     else:
                         return
                 else:
-                    # Fallback JSON parsing
                     try:
                         p_json = json.loads(payload_str)
                         if 'watts' in p_json:
+                            solar_data['watts_count'] += 1
                             raw_p_val = None
                             if 'power_W' in p_json:
                                 raw_p_val = float(p_json['power_W'])
@@ -1016,7 +1059,7 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                     return
 
                 # =========================================================================
-                # 3. ATOMIC PACKET COMMITMENT (Strict validation with ZERO fallbacks)
+                # 3. ATOMIC PACKET COMMITMENT
                 # =========================================================================
                 c_v = completed_cycle['voltage']
                 c_i = completed_cycle['current']
@@ -1026,12 +1069,17 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                 c_lux = completed_cycle['lux']
                 c_watts = completed_cycle['watts']
 
-                # Strict check: Every core measurement must be present in THIS cycle
-                if c_v is None or c_i is None or c_temp is None or c_lux is None or c_watts is None:
+                if c_pw is None:
+              if c_v > 0 or c_i > 0:
+                    c_pw = (c_v * c_i) / 1000.0
+                    c_pmw = c_pw * 1000.0
+            else:
+                    c_pw = 0.0
+                    c_pmw = 0.0
+                    solar_data['discarded_cycle_count'] += 1
                     add_event("warning", "Incomplete cycle discarded: missing required telemetry metric")
                     return
 
-                # Handle electrical power if /power was not explicitly transmitted
                 if c_pw is None:
                     if c_v > 0 or c_i > 0:
                         c_pw = (c_v * c_i) / 1000.0
@@ -1040,7 +1088,6 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                         c_pw = 0.0
                         c_pmw = 0.0
 
-                # Atomically update live gauges exclusively from this completed cycle
                 solar_data['voltage'] = c_v
                 solar_data['current'] = c_i
                 solar_data['power_w'] = c_pw
@@ -1053,7 +1100,6 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                 cycle_iso = completed_cycle['start_iso']
                 cycle_display = completed_cycle['start_display']
 
-                # Numerical Riemann sum energy integration
                 if solar_data['last_energy_calc_time'] is not None:
                     dt_sec = (cycle_dt - solar_data['last_energy_calc_time']).total_seconds()
                     if 0 < dt_sec < 180:
@@ -1063,6 +1109,7 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
 
                 solar_data['last_energy_calc_time'] = cycle_dt
                 solar_data['last_update_time'] = cycle_dt
+                solar_data['committed_cycle_count'] += 1
 
                 record = {
                     'timestamp': cycle_iso,
@@ -1085,7 +1132,6 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                     if popped_ts:
                         solar_data['seen_timestamps'].discard(str(popped_ts))
 
-                # Persistent CSV logging via decoupled non-blocking queue
                 if solar_data['logging_active']:
                     is_day = is_daytime(cycle_dt, c_watts, c_lux)
                     req_interval = PERSISTENT_LOG_INTERVAL_DAY_SEC if is_day else PERSISTENT_LOG_INTERVAL_NIGHT_SEC
@@ -1101,7 +1147,6 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
 
                     if should_persist:
                         solar_data['last_persisted_time'] = cycle_dt
-                        # Non-blocking put to guarantee zero disk I/O in MQTT loop
                         try:
                             solar_data['csv_queue'].put_nowait(record)
                             mode_lbl = "Day (5m)" if is_day else "Night (1h)"
@@ -1194,7 +1239,6 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Thread-safe atomic snapshot of display metrics
 with data_lock:
     records_copy = list(solar_data['log_records'])
     current_power_w = solar_data['power_w']
@@ -1205,7 +1249,6 @@ with data_lock:
     reconnect_val = solar_data['reconnect_count']
     msg_count_val = solar_data['msg_count']
 
-# PATCH: تبدیل و نرمال‌سازی ایمن تایم‌استمپ بدون کرش و فیلتر کردن مقادیر نامعتبر
 df_raw = pd.DataFrame(records_copy)
 if not df_raw.empty and 'timestamp' in df_raw.columns:
     df_raw['dt'] = pd.to_datetime(df_raw['timestamp'], errors='coerce', format='mixed')
