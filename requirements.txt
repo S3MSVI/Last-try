@@ -1,0 +1,7 @@
+streamlit
+paho-mqtt
+pandas
+requests
+pytz
+jdatetime
+plotly
