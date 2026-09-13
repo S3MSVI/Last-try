@@ -1061,40 +1061,37 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                 # =========================================================================
                 # 3. ATOMIC PACKET COMMITMENT
                 # =========================================================================
-                c_v = completed_cycle['voltage']
-                c_i = completed_cycle['current']
-                c_pw = completed_cycle['power_w']
-                c_pmw = completed_cycle['power_mw']
-                c_temp = completed_cycle['temp']
-                c_lux = completed_cycle['lux']
-                c_watts = completed_cycle['watts']
+            c_v = completed_cycle['voltage']
+c_i = completed_cycle['current']
+c_pw = completed_cycle['power_w']
+c_pmw = completed_cycle['power_mw']
+c_temp = completed_cycle['temp']
+c_lux = completed_cycle['lux']
+c_watts = completed_cycle['watts']
 
-                if c_pw is None:
-              if c_v > 0 or c_i > 0:
-                    c_pw = (c_v * c_i) / 1000.0
-                    c_pmw = c_pw * 1000.0
-            else:
-                    c_pw = 0.0
-                    c_pmw = 0.0
-                    solar_data['discarded_cycle_count'] += 1
-                    add_event("warning", "Incomplete cycle discarded: missing required telemetry metric")
-                    return
+if (
+    c_v is None or
+    c_i is None or
+    c_pw is None or
+    c_pmw is None or
+    c_temp is None or
+    c_lux is None or
+    c_watts is None
+):
+    solar_data['discarded_cycle_count'] += 1
+    add_event(
+        "warning",
+        "Incomplete cycle discarded: missing required telemetry metric"
+    )
+    return
 
-                if c_pw is None:
-                    if c_v > 0 or c_i > 0:
-                        c_pw = (c_v * c_i) / 1000.0
-                        c_pmw = c_pw * 1000.0
-                    else:
-                        c_pw = 0.0
-                        c_pmw = 0.0
-
-                solar_data['voltage'] = c_v
-                solar_data['current'] = c_i
-                solar_data['power_w'] = c_pw
-                solar_data['power_mw'] = c_pmw
-                solar_data['temp'] = c_temp
-                solar_data['lux'] = c_lux
-                solar_data['watts'] = c_watts
+solar_data['voltage'] = c_v
+solar_data['current'] = c_i
+solar_data['power_w'] = c_pw
+solar_data['power_mw'] = c_pmw
+solar_data['temp'] = c_temp
+solar_data['lux'] = c_lux
+solar_data['watts'] = c_watts
 
                 cycle_dt = completed_cycle['start_dt']
                 cycle_iso = completed_cycle['start_iso']
