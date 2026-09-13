@@ -1205,12 +1205,20 @@ with data_lock:
     reconnect_val = solar_data['reconnect_count']
     msg_count_val = solar_data['msg_count']
 
+# PATCH: تبدیل و نرمال‌سازی ایمن تایم‌استمپ بدون کرش و فیلتر کردن مقادیر نامعتبر
 df_raw = pd.DataFrame(records_copy)
-if not df_raw.empty:
-    df_raw['dt'] = pd.to_datetime(df_raw['timestamp'])
-    if df_raw['dt'].dt.tz is None:
-        df_raw['dt'] = df_raw['dt'].dt.tz_localize(tehran_tz)
-    df_raw = df_raw.sort_values('dt').drop_duplicates(subset=['dt']).reset_index(drop=True)
+if not df_raw.empty and 'timestamp' in df_raw.columns:
+    df_raw['dt'] = pd.to_datetime(df_raw['timestamp'], errors='coerce', format='mixed')
+    df_raw = df_raw.dropna(subset=['dt']).copy()
+
+    if not df_raw.empty:
+        if df_raw['dt'].dt.tz is None:
+            df_raw['dt'] = df_raw['dt'].dt.tz_localize(tehran_tz, ambiguous='NaT', nonexistent='shift_forward')
+        else:
+            df_raw['dt'] = df_raw['dt'].dt.tz_convert(tehran_tz)
+
+        df_raw = df_raw.dropna(subset=['dt'])
+        df_raw = df_raw.sort_values('dt').drop_duplicates(subset=['dt']).reset_index(drop=True)
 
 active_timeframe = st.session_state['chart_timeframe']
 if df_raw.empty:
