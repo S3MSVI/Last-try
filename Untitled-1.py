@@ -66,7 +66,8 @@ def get_icon(name: str, size: int = 16, color: str = "currentColor") -> str:
         'cloud-rain': f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M16 14v6"/><path d="M8 14v6"/><path d="M12 16v6"/></svg>',
         'compass': f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>',
         'eye': f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>',
-        'refresh-cw': f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>'
+        'refresh-cw': f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>',
+        'trash-2': f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>'
     }
     return icons.get(name, f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"><circle cx="12" cy="12" r="8"/></svg>')
 
@@ -640,6 +641,40 @@ def load_data_from_csv():
             pass
     return []
 
+# PATCH: تابع اختصاصی جهت حذف ایمن چندتایی رکوردها بدون بازنشانی کانترها یا قطعی MQTT
+def delete_records_by_timestamps(target_timestamps):
+    """Safely deletes telemetry records by timestamps from log_records, seen_timestamps, and CSV."""
+    target_set = set(str(ts).strip() for ts in target_timestamps)
+    if not target_set:
+        return 0
+
+    deleted_count = 0
+    # 1. حذف از حافظه در حال اجرا و seen_timestamps تحت قفل Thread-Safe
+    with data_lock:
+        initial_len = len(solar_data['log_records'])
+        solar_data['log_records'] = [
+            r for r in solar_data['log_records']
+            if str(r.get('timestamp', '')).strip() not in target_set
+        ]
+        deleted_count = initial_len - len(solar_data['log_records'])
+        for ts in target_set:
+            solar_data['seen_timestamps'].discard(ts)
+
+    # 2. حذف از فایل ذخیره‌سازی محلی CSV با حفظ تمام ستون‌های دیگر
+    if os.path.exists(CSV_BACKUP_FILE):
+        try:
+            df_csv = pd.read_csv(CSV_BACKUP_FILE)
+            if not df_csv.empty and 'timestamp' in df_csv.columns:
+                mask = ~df_csv['timestamp'].astype(str).str.strip().isin(target_set)
+                df_csv_clean = df_csv[mask]
+                df_csv_clean.to_csv(CSV_BACKUP_FILE, index=False)
+        except Exception as e_csv:
+            add_event("warning", f"CSV file deletion error: {e_csv}")
+
+    if deleted_count > 0:
+        add_event("info", f"Operator deleted {deleted_count} telemetry record(s).")
+    return deleted_count
+
 # Background worker thread function to prevent History / CSV I/O from stalling MQTT callback
 def _telemetry_background_worker(state):
     hist_q = state['hist_queue']
@@ -693,7 +728,7 @@ def _telemetry_background_worker(state):
                                 hist_iso = clean_ts
                                 try:
                                     hist_dt = datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
-                                    hihist_display = f"Hist {hist_dt.strftime('%H:%M:%S')}"
+                                    hist_display = hist_dt.strftime("%H:%M:%S")
                                 except Exception:
                                     hist_display = hist_ts_raw[-8:]
 
@@ -716,7 +751,6 @@ def _telemetry_background_worker(state):
                                 if hist_iso not in state['seen_timestamps']:
                                     state['seen_timestamps'].add(hist_iso)
                                     state['log_records'].append(hist_record)
-                                    # Discard oldest timestamp to bound memory footprint
                                     if len(state['log_records']) > 1500:
                                         popped = state['log_records'].pop(0)
                                         popped_ts = popped.get('timestamp')
@@ -803,6 +837,7 @@ def get_sensor_data():
         'log_records': initial_records,
         'seen_timestamps': initial_seen_ts,
         'current_cycle': None,
+        'power_unit': "Milliwatts (mW)",
         # Instrumentation Debug Counters
         'voltage_count': 0,
         'current_count': 0,
@@ -852,6 +887,8 @@ with st.sidebar:
         index=0,
         help="Explicitly defines the hardware unit transmitted on the power topic. Default is Milliwatts (mW) from INA219."
     )
+    with data_lock:
+        solar_data['power_unit'] = incoming_power_unit
     
     st.markdown("---")
     if st.button("Reset Telemetry Session", use_container_width=True):
@@ -870,7 +907,6 @@ with st.sidebar:
             solar_data['seen_timestamps'].clear()
             solar_data['current_cycle'] = None
             solar_data['msg_count'] = 0
-            # Reset Debug Counters
             solar_data['voltage_count'] = 0
             solar_data['current_count'] = 0
             solar_data['power_count'] = 0
@@ -910,7 +946,7 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
             payload_str = msg.payload.decode('utf-8', errors='ignore').strip()
             topic_str = msg.topic.strip()
             now_dt = datetime.now(tehran_tz)
-            now_iso = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+            now_iso = now_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             now_display = now_dt.strftime("%H:%M:%S")
 
             # =========================================================================
@@ -935,8 +971,11 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
             completed_cycle = None
 
             with data_lock:
+                active_power_unit = solar_data.get('power_unit', "Milliwatts (mW)")
+
                 if topic_str.endswith('/voltage'):
                     solar_data['voltage_count'] += 1
+                    solar_data['msg_count'] += 1
                     if solar_data['current_cycle'] is not None:
                         solar_data['discarded_cycle_count'] += 1
                         add_event("warning", "Incomplete telemetry cycle discarded (missing /watts)")
@@ -953,59 +992,58 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                         'lux': None,
                         'watts': None
                     }
-                    solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/current'):
                     solar_data['current_count'] += 1
+                    solar_data['msg_count'] += 1
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['current'] = float(payload_str)
-                    solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/power_mw'):
                     solar_data['power_count'] += 1
+                    solar_data['msg_count'] += 1
                     raw_p = float(payload_str)
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['power_mw'] = raw_p
                         solar_data['current_cycle']['power_w'] = raw_p / 1000.0
-                    solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/power_w'):
                     solar_data['power_count'] += 1
+                    solar_data['msg_count'] += 1
                     raw_p = float(payload_str)
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['power_w'] = raw_p
                         solar_data['current_cycle']['power_mw'] = raw_p * 1000.0
-                    solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/power'):
                     solar_data['power_count'] += 1
+                    solar_data['msg_count'] += 1
                     raw_p = float(payload_str)
                     if solar_data['current_cycle'] is not None:
-                        if incoming_power_unit == "Watts (W)":
+                        if active_power_unit == "Watts (W)":
                             solar_data['current_cycle']['power_w'] = raw_p
                             solar_data['current_cycle']['power_mw'] = raw_p * 1000.0
                         else:
                             solar_data['current_cycle']['power_mw'] = raw_p
                             solar_data['current_cycle']['power_w'] = raw_p / 1000.0
-                    solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/temperature'):
                     solar_data['temperature_count'] += 1
+                    solar_data['msg_count'] += 1
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['temp'] = float(payload_str)
-                    solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/lux'):
                     solar_data['lux_count'] += 1
+                    solar_data['msg_count'] += 1
                     if solar_data['current_cycle'] is not None:
                         solar_data['current_cycle']['lux'] = float(payload_str)
-                    solar_data['msg_count'] += 1
                     return
 
                 elif topic_str.endswith('/watts'):
@@ -1039,7 +1077,7 @@ def start_mqtt_client(broker: str, port: int, topic: str, fallback_host: str):
                                 raw_p_val = float(p_json['power_mW']) / 1000.0
                             elif 'power' in p_json:
                                 p_in = float(p_json['power'])
-                                raw_p_val = p_in if incoming_power_unit == "Watts (W)" else p_in / 1000.0
+                                raw_p_val = p_in if active_power_unit == "Watts (W)" else p_in / 1000.0
 
                             completed_cycle = {
                                 'start_dt': now_dt,
@@ -1246,7 +1284,7 @@ with data_lock:
     current_current = solar_data['current']
     current_temp = solar_data['temp']
     reconnect_val = solar_data['reconnect_count']
-    msg_count_val = solar_data['msg_count']
+    committed_cycles = solar_data['committed_cycle_count']
 
 df_raw = pd.DataFrame(records_copy)
 if not df_raw.empty and 'timestamp' in df_raw.columns:
@@ -1260,7 +1298,7 @@ if not df_raw.empty and 'timestamp' in df_raw.columns:
             df_raw['dt'] = df_raw['dt'].dt.tz_convert(tehran_tz)
 
         df_raw = df_raw.dropna(subset=['dt'])
-        df_raw = df_raw.sort_values('dt').drop_duplicates(subset=['dt']).reset_index(drop=True)
+        df_raw = df_raw.sort_values('dt').drop_duplicates(subset=['timestamp']).reset_index(drop=True)
 
 active_timeframe = st.session_state['chart_timeframe']
 if df_raw.empty:
@@ -1837,8 +1875,8 @@ with col_right:
             <span class="status-val tabular-val">{reconnect_val}</span>
         </div>
         <div class="status-row">
-            <span class="status-label">{get_icon('activity', size=14, color='#0284c7')} Total Packets</span>
-            <span class="status-val tabular-val">{msg_count_val}</span>
+            <span class="status-label">{get_icon('activity', size=14, color='#0284c7')} Total Telemetry Cycles</span>
+            <span class="status-val tabular-val">{committed_cycles}</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1944,6 +1982,9 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# 2. Telemetry Audit Log Table with Multi-Row Selection & Record Deletion
+has_active_table_selection = False
+
 with st.container(border=True):
     tbl_h1, tbl_h2 = st.columns([7, 3])
     with tbl_h1:
@@ -1955,14 +1996,62 @@ with st.container(border=True):
         df_table = df_raw.copy()
         display_cols = ['time_display', 'voltage_V', 'current_mA', 'power_W', 'energy_kWh', 'temperature_C', 'illuminance_lux', 'irradiance_W_m2']
         avail_cols = [c for c in display_cols if c in df_table.columns]
+        
+        # استخراج ردیف‌های جدول به ترتیب زمانی معکوس (جدیدترین در بالا)
         df_disp = df_table[avail_cols].tail(row_count).iloc[::-1].copy()
+        raw_ts_series = df_table['timestamp'].tail(row_count).iloc[::-1].values
+        
         rename_map = {
             'time_display': 'Time', 'voltage_V': 'Voltage (V)', 'current_mA': 'Current (mA)',
             'power_W': 'Power (W)', 'energy_kWh': 'Energy (kWh)', 'temperature_C': 'Temp (°C)',
             'illuminance_lux': 'Illuminance (Lux)', 'irradiance_W_m2': 'Irradiance (W/m²)'
         }
         df_disp = df_disp.rename(columns=rename_map)
-        st.dataframe(df_disp, use_container_width=True, height=210)
+
+        # PATCH: افزودن ستون Checkbox انتخابی و فیلد مخفی raw_timestamp برای تطبیق دقیق
+        df_disp.insert(0, 'Select', False)
+        df_disp['raw_timestamp'] = raw_ts_series
+
+        # رندر جدول داده با استفاده از st.data_editor بدون تغییر استایل و ابعاد ظاهری
+        edited_table = st.data_editor(
+            df_disp,
+            hide_index=True,
+            use_container_width=True,
+            height=210,
+            disabled=[col for col in df_disp.columns if col != 'Select'],
+            column_config={
+                "Select": st.column_config.CheckboxColumn(
+                    "Select",
+                    help="Select record to delete",
+                    default=False
+                ),
+                "raw_timestamp": None  # پنهان‌سازی ستون خام تایم‌استمپ از دید کاربر
+            },
+            key="audit_log_editor"
+        )
+
+        # بررسی رکوردهای علامت‌زده‌شده توسط کاربر
+        selected_rows = edited_table[edited_table['Select'] == True]
+        selected_timestamps = selected_rows['raw_timestamp'].tolist()
+
+        if len(selected_timestamps) > 0:
+            has_active_table_selection = True
+            st.markdown("<div style='margin-top: 8px;'></div>", unsafe_allow_html=True)
+            del_c1, del_c2, del_c3 = st.columns([5, 3, 2])
+            with del_c1:
+                st.warning(f"⚠️ **{len(selected_timestamps)}** record(s) selected for deletion.")
+            with del_c2:
+                confirm_del = st.checkbox("Confirm Permanent Deletion", key="chk_confirm_delete")
+            with del_c3:
+                if st.button("Delete Selected Records", type="primary", disabled=not confirm_del, use_container_width=True):
+                    # اجرای فرآیند حذف قطعی و ایمن از حافظه و CSV
+                    deleted_num = delete_records_by_timestamps(selected_timestamps)
+                    # پاک‌سازی وضعیت انتخاب‌ها در سشن‌استیت
+                    if 'audit_log_editor' in st.session_state:
+                        del st.session_state['audit_log_editor']
+                    st.success(f"Successfully deleted {deleted_num} record(s).")
+                    time.sleep(0.5)
+                    st.rerun()
     else:
         st.info("Waiting for incoming telemetry packets to populate table...")
 
@@ -1970,5 +2059,7 @@ with st.container(border=True):
 # 12. LIVE UPDATE AUTO-RERUN LOOP
 # =========================================================================================
 if live_update:
-    time.sleep(3.5)
-    st.rerun()
+    # جلوگیری از رفرش خودکار صفحه در حین علامت‌زدن رکوردها توسط کاربر
+    if not has_active_table_selection:
+        time.sleep(3.5)
+        st.rerun()
