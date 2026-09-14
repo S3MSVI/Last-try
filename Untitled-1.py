@@ -693,7 +693,7 @@ def _telemetry_background_worker(state):
                                 hist_iso = clean_ts
                                 try:
                                     hist_dt = datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
-                                    hist_display = hist_dt.strftime("%H:%M:%S")
+                                    hihist_display = f"Hist {hist_dt.strftime('%H:%M:%S')}"
                                 except Exception:
                                     hist_display = hist_ts_raw[-8:]
 
